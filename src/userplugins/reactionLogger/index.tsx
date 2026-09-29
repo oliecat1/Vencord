@@ -5,6 +5,12 @@
  * (by its owner, by a moderator, or in bulk) it stays visible under the
  * message in a grayed-out, red-tinted "removed" pill.
  *
+ * Interactions:
+ *  - Click a removed pill            -> dismiss it
+ *  - Right-click a removed pill      -> keep / unkeep it (kept pills survive
+ *                                       every "clear" and cache eviction)
+ *  - Message context menu            -> clear this message's logged reactions
+ *
  * Drop this folder in `src/userplugins/reactionLogger/` (together with
  * styles.css) and rebuild Vencord.
  */
@@ -19,6 +25,7 @@ import {
     ChannelStore,
     FluxDispatcher,
     GuildMemberStore,
+    Menu,
     MessageStore,
     Tooltip,
     useEffect,
@@ -62,6 +69,8 @@ interface RemovedReaction {
     removedAt: number;
     reason: RemovalReason;
     burst: boolean;
+    /** Kept entries are skipped by "clear" actions and by cache eviction. */
+    kept: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -87,8 +96,8 @@ const settings = definePluginSettings({
     clearCache: {
         type: OptionType.COMPONENT,
         component: () => (
-            <Button color={Button.Colors.RED} size={Button.Sizes.SMALL} onClick={clearAll}>
-                Clear cached reactions
+            <Button color={Button.Colors.RED} size={Button.Sizes.SMALL} onClick={() => clearLogged()}>
+                Clear all logged reactions
             </Button>
         )
     }
@@ -124,13 +133,14 @@ function removeEntry(entry: RemovedReaction) {
 function trim() {
     const max = Math.max(1, Math.floor(Number(settings.store.maxCachedReactions) || 500));
     while (queue.length > max) {
-        const oldest = queue[0];
+        const oldest = queue.find(e => !e.kept);
+        if (!oldest) break; // everything left is kept, nothing to evict
         removeEntry(oldest);
         notify(oldest.messageId);
     }
 }
 
-function addEntry(entry: RemovedReaction) {
+function addEntry(entry: Omit<RemovedReaction, "kept">) {
     let list = byMessage.get(entry.messageId);
 
     // Same emoji + same user already logged -> just refresh it instead of duplicating.
@@ -143,17 +153,45 @@ function addEntry(entry: RemovedReaction) {
         return;
     }
 
+    const full: RemovedReaction = { ...entry, kept: false };
     if (!list) byMessage.set(entry.messageId, list = []);
-    list.push(entry);
-    queue.push(entry);
+    list.push(full);
+    queue.push(full);
     trim();
     notify(entry.messageId);
 }
 
-function clearAll() {
+/**
+ * Clears logged reactions, sparing the ones marked as kept.
+ * Pass a messageId to clear only that message, or nothing to clear everything.
+ */
+function clearLogged(messageId?: string) {
+    const source = messageId ? (byMessage.get(messageId) ?? []) : queue;
+    // .filter() returns a copy, so removing while iterating is safe.
+    for (const entry of source.filter(e => !e.kept)) removeEntry(entry);
+    notify(messageId ?? null);
+}
+
+/** Wipes everything, kept entries included (used when the plugin stops). */
+function resetAll() {
     byMessage.clear();
     queue.length = 0;
     notify(null);
+}
+
+/** Click on a pill: drop every entry of that emoji on that message. */
+function dismissGroup(group: RemovedReaction[]) {
+    if (!group.length) return;
+    for (const entry of group) removeEntry(entry);
+    notify(group[0].messageId);
+}
+
+/** Right-click on a pill: toggle the "kept" flag of the whole group. */
+function toggleKeepGroup(group: RemovedReaction[]) {
+    if (!group.length) return;
+    const keep = !group.every(e => e.kept);
+    for (const entry of group) entry.kept = keep;
+    notify(group[0].messageId);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -321,7 +359,7 @@ function getUserLabel(entry: RemovedReaction): string {
             : "Unknown user(s) - emoji cleared") + n;
     }
 
-     const user = UserStore.getUser(entry.userId);
+    const user = UserStore.getUser(entry.userId);
     if (!user) return entry.userId;
 
     const guildId = ChannelStore.getChannel(entry.channelId)?.guild_id;
@@ -335,10 +373,13 @@ function getUserLabel(entry: RemovedReaction): string {
 function PillTooltip({ group }: { group: RemovedReaction[]; }) {
     const { emoji } = group[0];
     const label = emoji.id ? `:${emoji.name}:` : emoji.name;
+    const kept = group.every(e => e.kept);
 
     return (
         <div className="vc-reaction-logger-tooltip">
-            <div className="vc-reaction-logger-tooltip-title">Removed reaction {label}</div>
+            <div className="vc-reaction-logger-tooltip-title">
+                Removed reaction {label}{kept ? " (kept)" : ""}
+            </div>
             {group.map((e, i) => (
                 <div key={`${e.userId ?? "unknown"}-${i}`} className="vc-reaction-logger-tooltip-line">
                     <span className="vc-reaction-logger-user">{getUserLabel(e)}</span>
@@ -346,6 +387,9 @@ function PillTooltip({ group }: { group: RemovedReaction[]; }) {
                     <span className="vc-reaction-logger-time"> - {new Date(e.removedAt).toLocaleString()}</span>
                 </div>
             ))}
+            <div className="vc-reaction-logger-hint">
+                Click: remove - Right-click: {kept ? "unkeep" : "keep"}
+            </div>
         </div>
     );
 }
@@ -353,15 +397,26 @@ function PillTooltip({ group }: { group: RemovedReaction[]; }) {
 function RemovedPill({ group }: { group: RemovedReaction[]; }) {
     const { emoji } = group[0];
     const total = group.reduce((sum, e) => sum + (e.count || 1), 0);
+    const kept = group.every(e => e.kept);
 
     return (
         <Tooltip text={<PillTooltip group={group} />}>
             {tooltipProps => (
-                <div {...tooltipProps} className="vc-reaction-logger-pill">
+                <div
+                    {...tooltipProps}
+                    className={kept ? "vc-reaction-logger-pill vc-reaction-logger-kept" : "vc-reaction-logger-pill"}
+                    role="button"
+                    onClick={() => dismissGroup(group)}
+                    onContextMenu={e => {
+                        e.preventDefault();
+                        toggleKeepGroup(group);
+                    }}
+                >
                     {emoji.url
                         ? <img className="vc-reaction-logger-emoji" src={emoji.url} alt={emoji.name ?? "emoji"} draggable={false} />
                         : <span className="vc-reaction-logger-emoji vc-reaction-logger-unicode">{emoji.name}</span>}
                     <span className="vc-reaction-logger-count">{total}</span>
+                    {kept && <span className="vc-reaction-logger-pin">📌</span>}
                 </div>
             )}
         </Tooltip>
@@ -444,7 +499,7 @@ export default definePlugin({
             if (i !== -1) list!.splice(i, 1);
         }
 
-        clearAll();
+        resetAll();
     },
 
     /**
@@ -455,5 +510,25 @@ export default definePlugin({
         <ErrorBoundary noop>
             <RemovedReactionsRow message={props.message} />
         </ErrorBoundary>
-    )
+    ),
+
+    /** Adds a clear button to the message right-click menu (like MessageLogger's "Remove Message History"). */
+    contextMenus: {
+        "message": (children, props) => {
+            const messageId: string | undefined = props?.message?.id;
+            const hasHere = !!messageId && !!byMessage.get(messageId)?.some(e => !e.kept);
+            if (!hasHere) return;
+
+            children.push(
+                <Menu.MenuGroup>
+                    <Menu.MenuItem
+                        id="vc-reaction-logger-clear-message"
+                        label="Clear Logged Reactions"
+                        color="danger"
+                        action={() => clearLogged(messageId)}
+                    />
+                </Menu.MenuGroup>
+            );
+        }
+    }
 });
