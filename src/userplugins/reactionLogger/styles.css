@@ -34,11 +34,23 @@
     border: 1px dashed rgba(240, 71, 71, 0.6);
     border-radius: 8px;
     background-color: rgba(240, 71, 71, 0.1);
-    cursor: default;
+    cursor: pointer;
+    user-select: none;
 }
 
 .vc-reaction-logger-pill:hover {
     background-color: rgba(240, 71, 71, 0.18);
+}
+
+/* Kept pills (right-click): solid border, stronger tint */
+.vc-reaction-logger-kept {
+    border-style: solid;
+    background-color: rgba(240, 71, 71, 0.16);
+}
+
+.vc-reaction-logger-pin {
+    font-size: 11px;
+    line-height: 1;
 }
 
 /* Grayed-out emoji */
@@ -76,6 +88,12 @@
 .vc-reaction-logger-tooltip-line {
     font-size: 13px;
     line-height: 1.35;
+}
+
+.vc-reaction-logger-hint {
+    margin-top: 6px;
+    font-size: 11px;
+    opacity: 0.6;
 }
 
 /* Red highlight for the user who reacted / removed */
