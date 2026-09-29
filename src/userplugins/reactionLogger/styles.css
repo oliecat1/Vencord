@@ -1,0 +1,90 @@
+/* ReactionLogger - removed reaction styling (echoes MessageLogger's deleted-message look) */
+
+.vc-reaction-logger-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin-top: 4px;
+}
+
+/* "Removed" badge + divider separating these pills from live reactions */
+.vc-reaction-logger-badge {
+    display: inline-flex;
+    align-items: center;
+    height: 20px;
+    padding: 0 8px 0 0;
+    margin-right: 2px;
+    border-right: 2px solid rgba(240, 71, 71, 0.6);
+    color: var(--status-danger, #f04747);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    user-select: none;
+}
+
+.vc-reaction-logger-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 24px;
+    padding: 0 6px;
+    box-sizing: border-box;
+    border: 1px dashed rgba(240, 71, 71, 0.6);
+    border-radius: 8px;
+    background-color: rgba(240, 71, 71, 0.1);
+    cursor: default;
+}
+
+.vc-reaction-logger-pill:hover {
+    background-color: rgba(240, 71, 71, 0.18);
+}
+
+/* Grayed-out emoji */
+.vc-reaction-logger-emoji {
+    width: 16px;
+    height: 16px;
+    object-fit: contain;
+    opacity: 0.5;
+    filter: grayscale(1);
+}
+
+.vc-reaction-logger-unicode {
+    display: inline-block;
+    width: auto;
+    font-size: 16px;
+    line-height: 16px;
+}
+
+.vc-reaction-logger-count {
+    color: var(--status-danger, #f04747);
+    font-size: 14px;
+    font-weight: 600;
+}
+
+/* Tooltip (rendered in a portal, so classes are global) */
+.vc-reaction-logger-tooltip {
+    max-width: 320px;
+}
+
+.vc-reaction-logger-tooltip-title {
+    margin-bottom: 4px;
+    font-weight: 700;
+}
+
+.vc-reaction-logger-tooltip-line {
+    font-size: 13px;
+    line-height: 1.35;
+}
+
+/* Red highlight for the user who reacted / removed */
+.vc-reaction-logger-user {
+    color: var(--status-danger, #f04747);
+    font-weight: 600;
+}
+
+.vc-reaction-logger-time {
+    opacity: 0.7;
+    font-size: 12px;
+}
