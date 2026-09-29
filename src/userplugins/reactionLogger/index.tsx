@@ -321,10 +321,15 @@ function getUserLabel(entry: RemovedReaction): string {
             : "Unknown user(s) - emoji cleared") + n;
     }
 
-    const user = UserStore.getUser(entry.userId);
+     const user = UserStore.getUser(entry.userId);
+    if (!user) return entry.userId;
+
     const guildId = ChannelStore.getChannel(entry.channelId)?.guild_id;
     const nick = guildId ? GuildMemberStore.getNick(guildId, entry.userId) : null;
-    return nick ?? user?.globalName ?? user?.username ?? entry.userId;
+    const display = nick ?? user.globalName ?? user.username;
+
+    // "Nickname (username)", or just the username if they're identical
+    return display !== user.username ? `${display} (${user.username})` : user.username;
 }
 
 function PillTooltip({ group }: { group: RemovedReaction[]; }) {
