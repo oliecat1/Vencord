@@ -15,6 +15,7 @@
  * styles.css) and rebuild Vencord.
  */
 
+import { get as dsGet, set as dsSet } from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
 import { disableStyle, enableStyle } from "@api/Styles";
 import ErrorBoundary from "@components/ErrorBoundary";
@@ -88,9 +89,18 @@ const settings = definePluginSettings({
         description: "Don't log reactions that you removed yourself",
         default: false
     },
+    persistLog: {
+        type: OptionType.BOOLEAN,
+        description: "Save removed reactions so they survive restarts",
+        default: true,
+        onChange: (enabled: boolean) => {
+            // Turning it on mid-session: load the saved log first so it isn't overwritten.
+            if (enabled && active) void loadLog();
+        }
+    },
     maxCachedReactions: {
         type: OptionType.NUMBER,
-        description: "Maximum number of removed reactions kept in memory (oldest are dropped first)",
+        description: "Maximum number of removed reactions kept (oldest are dropped first). Applies to the saved log too.",
         default: 500
     },
     clearCache: {
@@ -114,6 +124,7 @@ const queue: RemovedReaction[] = [];
 const listeners = new Set<(messageId: string | null) => void>();
 
 function notify(messageId: string | null) {
+    scheduleSave();
     for (const l of listeners) {
         try { l(messageId); } catch (e) { logger.error("listener threw", e); }
     }
@@ -192,6 +203,87 @@ function toggleKeepGroup(group: RemovedReaction[]) {
     const keep = !group.every(e => e.kept);
     for (const entry of group) entry.kept = keep;
     notify(group[0].messageId);
+}
+
+/* -------------------------------------------------------------------------- */
+/*                         Persistence (Vencord DataStore)                    */
+/* -------------------------------------------------------------------------- */
+
+// DataStore is Vencord's IndexedDB wrapper: data lives in Discord's profile
+// on disk, so it survives restarts. The cap is `maxCachedReactions`.
+const STORAGE_KEY = "ReactionLogger_removedReactions";
+
+/** True once the saved log has been loaded; saving before that would overwrite it. */
+let loaded = false;
+let saveTimer: ReturnType<typeof setTimeout> | undefined;
+
+function isValidEntry(e: any): boolean {
+    return !!e
+        && typeof e.messageId === "string"
+        && typeof e.channelId === "string"
+        && typeof e.emojiKey === "string"
+        && typeof e.removedAt === "number"
+        && !!e.emoji
+        && (typeof e.emoji.name === "string" || typeof e.emoji.id === "string")
+        && (e.userId === null || typeof e.userId === "string");
+}
+
+/** Writes the current log to disk right now. Takes its snapshot synchronously. */
+async function saveNow(): Promise<void> {
+    if (saveTimer !== undefined) {
+        clearTimeout(saveTimer);
+        saveTimer = undefined;
+    }
+
+    const snapshot = queue.map(e => ({ ...e, emoji: { ...e.emoji } }));
+    try {
+        await dsSet(STORAGE_KEY, snapshot);
+    } catch (e) {
+        logger.error("Failed to save removed reactions", e);
+    }
+}
+
+/** Debounced save, called after every change to the log. */
+function scheduleSave() {
+    if (!loaded || !settings.store.persistLog) return;
+    if (saveTimer !== undefined) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => void saveNow(), 500);
+}
+
+/** Restores the saved log and merges it with anything logged while loading. */
+async function loadLog(): Promise<void> {
+    if (!settings.store.persistLog) return;
+
+    try {
+        const saved = await dsGet<unknown>(STORAGE_KEY);
+        const restored: RemovedReaction[] = Array.isArray(saved)
+            ? saved.filter(isValidEntry).map(e => ({
+                ...e,
+                userId: e.userId ?? null,
+                count: Number(e.count) || 1,
+                kept: !!e.kept,
+                burst: !!e.burst
+            }))
+            : [];
+
+        const merged = [...restored, ...queue].sort((a, b) => a.removedAt - b.removedAt);
+        byMessage.clear();
+        queue.length = 0;
+
+        for (const e of merged) {
+            const list = byMessage.get(e.messageId);
+            if (list?.some(x => x.emojiKey === e.emojiKey && x.userId === e.userId)) continue;
+            if (list) list.push(e); else byMessage.set(e.messageId, [e]);
+            queue.push(e);
+        }
+
+        trim();
+        loaded = true;
+        notify(null); // re-renders visible rows and saves the merged result
+    } catch (e) {
+        // Leave `loaded` false so a failed read never overwrites the saved log.
+        logger.error("Failed to load saved reactions", e);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -472,6 +564,7 @@ export default definePlugin({
     start() {
         active = true;
         enableStyle(style);
+        void loadLog();
 
         const dispatcher = FluxDispatcher as any;
         if (typeof dispatcher.addInterceptor === "function") {
@@ -498,6 +591,13 @@ export default definePlugin({
             const i = list?.indexOf(interceptor) ?? -1;
             if (i !== -1) list!.splice(i, 1);
         }
+
+        // Flush the log to disk first, then stop saving so the wipe below
+        // (which only clears memory) can't overwrite it with an empty list.
+        if (loaded && settings.store.persistLog) void saveNow();
+        if (saveTimer !== undefined) clearTimeout(saveTimer);
+        saveTimer = undefined;
+        loaded = false;
 
         resetAll();
     },
