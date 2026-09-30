@@ -1,18 +1,20 @@
-   name: Build
-   on: workflow_dispatch
-   jobs:
-     build:
-       runs-on: ubuntu-latest
-       steps:
-         - uses: actions/checkout@v4
-         - uses: pnpm/action-setup@v4
-         - uses: actions/setup-node@v4
-           with:
-             node-version: lts/*
-             cache: pnpm
-         - run: pnpm install --frozen-lockfile
-         - run: pnpm build
-         - uses: actions/upload-artifact@v4
-           with:
-             name: vencord-dist
-             path: dist
+name: Build with ReactionLogger
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add MessageLoggerEnhanced
+        run: git clone --depth 1 https://github.com/Syncxv/vc-message-logger-enhanced.git src/userplugins/vc-message-logger-enhanced
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vencord-dist
+          path: dist
