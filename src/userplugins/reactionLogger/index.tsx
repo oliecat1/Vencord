@@ -6,9 +6,9 @@
  * message in a grayed-out, red-tinted "removed" pill.
  *
  * Interactions:
+ *  - Hover a removed pill            -> details card (stays open while hovered)
+ *  - Click a name in the card        -> copies that user's ID
  *  - Click a removed pill            -> dismiss it
- *  - Right-click a removed pill      -> keep / unkeep it (kept pills survive
- *                                       every "clear" and cache eviction)
  *  - Message context menu            -> clear this message's logged reactions
  *
  * Drop this folder in `src/userplugins/reactionLogger/` (together with
@@ -19,6 +19,7 @@ import { get as dsGet, set as dsSet } from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
 import { disableStyle, enableStyle } from "@api/Styles";
 import ErrorBoundary from "@components/ErrorBoundary";
+import { copyWithToast } from "@utils/discord";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType } from "@utils/types";
 import {
@@ -28,9 +29,11 @@ import {
     GuildMemberStore,
     Menu,
     MessageStore,
-    Tooltip,
+    ReactDOM,
     useEffect,
+    useRef,
     UserStore,
+    UserUtils,
     useState
 } from "@webpack/common";
 
@@ -65,13 +68,17 @@ interface RemovedReaction {
      * removals; for REMOVE_ALL / REMOVE_EMOJI it is null (unknown users).
      */
     userId: string | null;
+    /**
+     * "Nickname (username)" saved when the reaction was logged (or looked up
+     * later). Discord's local user cache is empty after a restart, so without
+     * this the log would fall back to showing raw user IDs.
+     */
+    userLabel: string | null;
     /** How many reactions this entry stands for (>1 only for bulk removals). */
     count: number;
     removedAt: number;
     reason: RemovalReason;
     burst: boolean;
-    /** Kept entries are skipped by "clear" actions and by cache eviction. */
-    kept: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -144,14 +151,13 @@ function removeEntry(entry: RemovedReaction) {
 function trim() {
     const max = Math.max(1, Math.floor(Number(settings.store.maxCachedReactions) || 500));
     while (queue.length > max) {
-        const oldest = queue.find(e => !e.kept);
-        if (!oldest) break; // everything left is kept, nothing to evict
+        const oldest = queue[0];
         removeEntry(oldest);
         notify(oldest.messageId);
     }
 }
 
-function addEntry(entry: Omit<RemovedReaction, "kept">) {
+function addEntry(entry: RemovedReaction) {
     let list = byMessage.get(entry.messageId);
 
     // Same emoji + same user already logged -> just refresh it instead of duplicating.
@@ -160,30 +166,30 @@ function addEntry(entry: Omit<RemovedReaction, "kept">) {
         dup.removedAt = entry.removedAt;
         dup.count = entry.count;
         dup.reason = entry.reason;
+        dup.userLabel = entry.userLabel ?? dup.userLabel;
         notify(entry.messageId);
         return;
     }
 
-    const full: RemovedReaction = { ...entry, kept: false };
     if (!list) byMessage.set(entry.messageId, list = []);
-    list.push(full);
-    queue.push(full);
+    list.push(entry);
+    queue.push(entry);
     trim();
     notify(entry.messageId);
 }
 
 /**
- * Clears logged reactions, sparing the ones marked as kept.
+ * Clears logged reactions.
  * Pass a messageId to clear only that message, or nothing to clear everything.
  */
 function clearLogged(messageId?: string) {
     const source = messageId ? (byMessage.get(messageId) ?? []) : queue;
-    // .filter() returns a copy, so removing while iterating is safe.
-    for (const entry of source.filter(e => !e.kept)) removeEntry(entry);
+    // Copy first: removeEntry mutates the arrays we're iterating over.
+    for (const entry of [...source]) removeEntry(entry);
     notify(messageId ?? null);
 }
 
-/** Wipes everything, kept entries included (used when the plugin stops). */
+/** Wipes everything from memory (used when the plugin stops). */
 function resetAll() {
     byMessage.clear();
     queue.length = 0;
@@ -197,12 +203,59 @@ function dismissGroup(group: RemovedReaction[]) {
     notify(group[0].messageId);
 }
 
-/** Right-click on a pill: toggle the "kept" flag of the whole group. */
-function toggleKeepGroup(group: RemovedReaction[]) {
-    if (!group.length) return;
-    const keep = !group.every(e => e.kept);
-    for (const entry of group) entry.kept = keep;
-    notify(group[0].messageId);
+/* -------------------------------------------------------------------------- */
+/*                              User name lookup                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * "Nickname (username)" from Discord's local caches, or null if the user isn't
+ * cached. Shows just the username when there's no different nickname/display name.
+ */
+function formatUserLabel(userId: string, channelId: string): string | null {
+    const user = UserStore.getUser(userId);
+    if (!user) return null;
+
+    const guildId = ChannelStore.getChannel(channelId)?.guild_id;
+    const nick = guildId ? GuildMemberStore.getNick(guildId, userId) : null;
+    const display = nick ?? user.globalName ?? user.username;
+
+    return display !== user.username ? `${display} (${user.username})` : user.username;
+}
+
+const pendingFetches = new Set<string>();
+const failedFetches = new Set<string>();
+
+/**
+ * Asks Discord for a user that isn't cached (e.g. an entry restored from disk
+ * before the user was ever loaded), then saves the resulting label on every
+ * entry of that user. Runs at most once per user per session.
+ */
+async function fetchUserLabel(userId: string): Promise<void> {
+    if (pendingFetches.has(userId) || failedFetches.has(userId)) return;
+    pendingFetches.add(userId);
+
+    try {
+        await UserUtils.getUser(userId);
+
+        let changed = false;
+        for (const e of queue) {
+            if (e.userId !== userId) continue;
+            const label = formatUserLabel(userId, e.channelId);
+            if (label && label !== e.userLabel) {
+                e.userLabel = label;
+                changed = true;
+            }
+        }
+
+        if (changed) notify(null);
+        else failedFetches.add(userId);
+    } catch (e) {
+        // Deleted account, rate limit, ... - don't retry this session.
+        failedFetches.add(userId);
+        logger.warn(`Could not look up user ${userId}`, e);
+    } finally {
+        pendingFetches.delete(userId);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -258,10 +311,15 @@ async function loadLog(): Promise<void> {
         const saved = await dsGet<unknown>(STORAGE_KEY);
         const restored: RemovedReaction[] = Array.isArray(saved)
             ? saved.filter(isValidEntry).map(e => ({
-                ...e,
+                messageId: e.messageId,
+                channelId: e.channelId,
+                emoji: e.emoji,
+                emojiKey: e.emojiKey,
                 userId: e.userId ?? null,
+                userLabel: typeof e.userLabel === "string" ? e.userLabel : null,
                 count: Number(e.count) || 1,
-                kept: !!e.kept,
+                removedAt: e.removedAt,
+                reason: e.reason ?? "single",
                 burst: !!e.burst
             }))
             : [];
@@ -325,6 +383,8 @@ function onRemove(action: any) {
         emoji: parsed.emoji,
         emojiKey: parsed.key,
         userId,
+        // Save the name now, while Discord still has the user cached.
+        userLabel: formatUserLabel(userId, channelId),
         count: 1,
         removedAt: Date.now(),
         reason: "single",
@@ -355,6 +415,7 @@ function onRemoveAll(action: any) {
             emoji: parsed.emoji,
             emojiKey: parsed.key,
             userId: null,
+            userLabel: null,
             count: r.count ?? 1,
             removedAt: now,
             reason: "all",
@@ -383,6 +444,7 @@ function onRemoveEmoji(action: any) {
         emoji: parsed.emoji,
         emojiKey: parsed.key,
         userId: null,
+        userLabel: null,
         count: live.count ?? 1,
         removedAt: Date.now(),
         reason: "emoji",
@@ -451,67 +513,139 @@ function getUserLabel(entry: RemovedReaction): string {
             : "Unknown user(s) - emoji cleared") + n;
     }
 
-    const user = UserStore.getUser(entry.userId);
-    if (!user) return entry.userId;
-
-    const guildId = ChannelStore.getChannel(entry.channelId)?.guild_id;
-    const nick = guildId ? GuildMemberStore.getNick(guildId, entry.userId) : null;
-    const display = nick ?? user.globalName ?? user.username;
-
-    // "Nickname (username)", or just the username if they're identical
-    return display !== user.username ? `${display} (${user.username})` : user.username;
+    // Live lookup first (picks up nickname changes), then the saved label,
+    // and only as a last resort the raw ID.
+    return formatUserLabel(entry.userId, entry.channelId) ?? entry.userLabel ?? entry.userId;
 }
 
-function PillTooltip({ group }: { group: RemovedReaction[]; }) {
+/** Contents of the hover card. */
+function PillDetails({ group }: { group: RemovedReaction[]; }) {
     const { emoji } = group[0];
     const label = emoji.id ? `:${emoji.name}:` : emoji.name;
-    const kept = group.every(e => e.kept);
+
+    // Look up users Discord hasn't cached (once per user per session).
+    useEffect(() => {
+        for (const e of group) {
+            if (e.userId && !e.userLabel && !formatUserLabel(e.userId, e.channelId)) {
+                void fetchUserLabel(e.userId);
+            }
+        }
+    });
 
     return (
-        <div className="vc-reaction-logger-tooltip">
-            <div className="vc-reaction-logger-tooltip-title">
-                Removed reaction {label}{kept ? " (kept)" : ""}
-            </div>
+        <>
+            <div className="vc-reaction-logger-popover-title">Removed reaction {label}</div>
             {group.map((e, i) => (
-                <div key={`${e.userId ?? "unknown"}-${i}`} className="vc-reaction-logger-tooltip-line">
-                    <span className="vc-reaction-logger-user">{getUserLabel(e)}</span>
+                <div key={`${e.userId ?? "unknown"}-${i}`} className="vc-reaction-logger-popover-line">
+                    {e.userId
+                        ? (
+                            <span
+                                className="vc-reaction-logger-user vc-reaction-logger-copyable"
+                                role="button"
+                                onClick={() => copyWithToast(e.userId!, "User ID copied!")}
+                            >
+                                {getUserLabel(e)}
+                            </span>
+                        )
+                        : <span className="vc-reaction-logger-user">{getUserLabel(e)}</span>}
                     {e.burst && <span className="vc-reaction-logger-time"> (super)</span>}
                     <span className="vc-reaction-logger-time"> - {new Date(e.removedAt).toLocaleString()}</span>
                 </div>
             ))}
             <div className="vc-reaction-logger-hint">
-                Click: remove - Right-click: {kept ? "unkeep" : "keep"}
+                Click a name: copy user ID - Click the pill: remove
             </div>
-        </div>
+        </>
     );
+}
+
+interface PopoverPos {
+    left: number;
+    top?: number;
+    bottom?: number;
 }
 
 function RemovedPill({ group }: { group: RemovedReaction[]; }) {
     const { emoji } = group[0];
     const total = group.reduce((sum, e) => sum + (e.count || 1), 0);
-    const kept = group.every(e => e.kept);
+
+    const pillRef = useRef<HTMLDivElement>(null);
+    const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+    const [pos, setPos] = useState<PopoverPos | null>(null);
+
+    const cancelClose = () => {
+        if (closeTimer.current !== undefined) {
+            clearTimeout(closeTimer.current);
+            closeTimer.current = undefined;
+        }
+    };
+
+    // Small delay so the mouse can travel from the pill into the card.
+    const scheduleClose = () => {
+        cancelClose();
+        closeTimer.current = setTimeout(() => setPos(null), 150);
+    };
+
+    const open = () => {
+        cancelClose();
+        const el = pillRef.current;
+        if (!el) return;
+
+        const r = el.getBoundingClientRect();
+        const left = Math.max(8, Math.min(r.left, window.innerWidth - 360));
+        // Prefer showing above the pill; go below if there's no room.
+        setPos(r.top > 170
+            ? { left, bottom: window.innerHeight - r.top + 6 }
+            : { left, top: r.bottom + 6 });
+    };
+
+    useEffect(() => cancelClose, []);
+
+    // The card is position:fixed, so close it if the chat scrolls underneath it.
+    const isOpen = pos !== null;
+    useEffect(() => {
+        if (!isOpen) return;
+        const close = () => setPos(null);
+        window.addEventListener("scroll", close, true);
+        return () => window.removeEventListener("scroll", close, true);
+    }, [isOpen]);
 
     return (
-        <Tooltip text={<PillTooltip group={group} />}>
-            {tooltipProps => (
+        <>
+            <div
+                ref={pillRef}
+                className="vc-reaction-logger-pill"
+                role="button"
+                onMouseEnter={open}
+                onMouseLeave={scheduleClose}
+                onClick={() => dismissGroup(group)}
+            >
+                {emoji.url
+                    ? <img className="vc-reaction-logger-emoji" src={emoji.url} alt={emoji.name ?? "emoji"} draggable={false} />
+                    : <span className="vc-reaction-logger-emoji vc-reaction-logger-unicode">{emoji.name}</span>}
+                <span className="vc-reaction-logger-count">{total}</span>
+            </div>
+
+            {/*
+              * Rendered in a portal on <body> so the chat's overflow clipping can't cut it off.
+              * It is a sibling of the pill (not a child), and stops click/context-menu events,
+              * so interacting with the card never triggers the pill's "dismiss" click or
+              * Discord's message handlers.
+              */}
+            {pos && ReactDOM.createPortal(
                 <div
-                    {...tooltipProps}
-                    className={kept ? "vc-reaction-logger-pill vc-reaction-logger-kept" : "vc-reaction-logger-pill"}
-                    role="button"
-                    onClick={() => dismissGroup(group)}
-                    onContextMenu={e => {
-                        e.preventDefault();
-                        toggleKeepGroup(group);
-                    }}
+                    className="vc-reaction-logger-popover"
+                    style={{ left: pos.left, top: pos.top, bottom: pos.bottom }}
+                    onMouseEnter={cancelClose}
+                    onMouseLeave={scheduleClose}
+                    onClick={e => e.stopPropagation()}
+                    onContextMenu={e => e.stopPropagation()}
                 >
-                    {emoji.url
-                        ? <img className="vc-reaction-logger-emoji" src={emoji.url} alt={emoji.name ?? "emoji"} draggable={false} />
-                        : <span className="vc-reaction-logger-emoji vc-reaction-logger-unicode">{emoji.name}</span>}
-                    <span className="vc-reaction-logger-count">{total}</span>
-                    {kept && <span className="vc-reaction-logger-pin">📌</span>}
-                </div>
+                    <PillDetails group={group} />
+                </div>,
+                document.body
             )}
-        </Tooltip>
+        </>
     );
 }
 
@@ -533,7 +667,7 @@ function RemovedReactionsRow({ message }: { message?: { id?: string; }; }) {
     const entries = byMessage.get(messageId);
     if (!entries?.length) return null;
 
-    // One pill per emoji, with all removers grouped in its tooltip.
+    // One pill per emoji, with all removers grouped in its hover card.
     const groups = new Map<string, RemovedReaction[]>();
     for (const e of entries) {
         const g = groups.get(e.emojiKey);
@@ -616,7 +750,7 @@ export default definePlugin({
     contextMenus: {
         "message": (children, props) => {
             const messageId: string | undefined = props?.message?.id;
-            const hasHere = !!messageId && !!byMessage.get(messageId)?.some(e => !e.kept);
+            const hasHere = !!messageId && !!byMessage.get(messageId)?.length;
             if (!hasHere) return;
 
             children.push(
