@@ -42,17 +42,6 @@
     background-color: rgba(240, 71, 71, 0.18);
 }
 
-/* Kept pills (right-click): solid border, stronger tint */
-.vc-reaction-logger-kept {
-    border-style: solid;
-    background-color: rgba(240, 71, 71, 0.16);
-}
-
-.vc-reaction-logger-pin {
-    font-size: 11px;
-    line-height: 1;
-}
-
 /* Grayed-out emoji */
 .vc-reaction-logger-emoji {
     width: 16px;
@@ -75,17 +64,27 @@
     font-weight: 600;
 }
 
-/* Tooltip (rendered in a portal, so classes are global) */
-.vc-reaction-logger-tooltip {
-    max-width: 320px;
+/* Hover card (rendered in a portal on <body>, so classes are global) */
+.vc-reaction-logger-popover {
+    position: fixed;
+    z-index: 100000;
+    box-sizing: border-box;
+    max-width: 340px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--background-floating, #111214);
+    color: var(--text-normal, #dbdee1);
+    box-shadow: var(--elevation-high, 0 8px 16px rgba(0, 0, 0, 0.4));
+    font-size: 14px;
+    line-height: 1.35;
 }
 
-.vc-reaction-logger-tooltip-title {
+.vc-reaction-logger-popover-title {
     margin-bottom: 4px;
     font-weight: 700;
 }
 
-.vc-reaction-logger-tooltip-line {
+.vc-reaction-logger-popover-line {
     font-size: 13px;
     line-height: 1.35;
 }
@@ -100,6 +99,15 @@
 .vc-reaction-logger-user {
     color: var(--status-danger, #f04747);
     font-weight: 600;
+}
+
+/* Names that copy the user ID when clicked */
+.vc-reaction-logger-copyable {
+    cursor: pointer;
+}
+
+.vc-reaction-logger-copyable:hover {
+    text-decoration: underline;
 }
 
 .vc-reaction-logger-time {
